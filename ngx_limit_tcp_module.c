@@ -14,7 +14,6 @@ typedef struct ngx_limit_tcp_ctx_s ngx_limit_tcp_ctx_t;
 
 
 typedef struct {
-    ngx_event_t                  src_event;
     ngx_limit_tcp_addr_t       **addrs;
 } ngx_limit_tcp_listen_ctx_t;
 
@@ -119,13 +118,10 @@ static char *ngx_limit_tcp_rule(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void *ngx_limit_tcp_create_conf(ngx_cycle_t *cycle);
 static ngx_int_t ngx_limit_tcp_init_zone(ngx_shm_zone_t *shm_zone,
     void *data);
+static ngx_int_t ngx_limit_tcp_init_module(ngx_cycle_t *cycle);
 static ngx_int_t ngx_limit_tcp_init_process(ngx_cycle_t *cycle);
-static void ngx_limit_tcp_event_accept(ngx_event_t *ev);
 static void ngx_limit_tcp_rbtree_insert_value(ngx_rbtree_node_t *temp,
     ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
-static void ngx_limit_tcp_event_accept_x(ngx_event_t *ev,
-    ngx_limit_tcp_listen_ctx_t *ctx);
-static void ngx_limit_tcp_close_accepted_connection(ngx_connection_t *c);
 static ngx_int_t ngx_limit_tcp_lookup(ngx_connection_t *c,
     ngx_limit_tcp_ctx_t *ctx, ngx_uint_t *ep, ngx_limit_tcp_node_t **node);
 static void ngx_limit_tcp_expire(ngx_connection_t *c, ngx_limit_tcp_ctx_t *ctx,
@@ -147,6 +143,7 @@ static ngx_int_t ngx_limit_tcp_mail_get_addr_index(ngx_listening_t *ls,
 static ngx_int_t ngx_limit_tcp_http_get_addr_index(ngx_listening_t *ls,
     struct sockaddr *addr, ngx_flag_t type);
 static void ngx_limit_tcp_accepted(ngx_event_t *ev);
+static ngx_int_t ngx_event_limit_accept_filter(ngx_connection_t *c);
 
 
 static ngx_core_module_t ngx_limit_tcp_ctx = {
@@ -189,7 +186,7 @@ ngx_module_t ngx_limit_tcp_module = {
     ngx_limit_tcp_commands,                /* module directives */
     NGX_CORE_MODULE,                       /* module type */
     NULL,                                  /* init master */
-    NULL,                                  /* init module */
+    ngx_limit_tcp_init_module,             /* init module */
     ngx_limit_tcp_init_process,            /* init process */
     NULL,                                  /* init thread */
     NULL,                                  /* exit thread */
@@ -197,6 +194,9 @@ ngx_module_t ngx_limit_tcp_module = {
     NULL,                                  /* exit master */
     NGX_MODULE_V1_PADDING
 };
+
+
+static ngx_event_accept_filter_pt ngx_event_next_accept_filter;
 
 
 static void *
@@ -746,12 +746,21 @@ ngx_limit_tcp_http_get_addr_index(ngx_listening_t *ls, struct sockaddr *addr,
 
 
 static ngx_int_t
+ngx_limit_tcp_init_module(ngx_cycle_t *cycle)
+{
+    ngx_event_next_accept_filter = ngx_event_top_accept_filter;
+    ngx_event_top_accept_filter = ngx_event_limit_accept_filter;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
 ngx_limit_tcp_init_process(ngx_cycle_t *cycle)
 {
-    ngx_int_t                   idx;
-    ngx_uint_t                  i, j;
-    ngx_event_t              *rev;
-    ngx_listening_t            *ls;
+    ngx_int_t                    idx;
+    ngx_uint_t                   i, j;
+    ngx_listening_t             *ls;
     ngx_connection_t            *c;
     ngx_limit_tcp_port_t        *port;
     ngx_limit_tcp_conf_t        *ltcf;
@@ -804,34 +813,10 @@ ngx_limit_tcp_init_process(ngx_cycle_t *cycle)
             lctx->addrs[idx] = paddr[j];
         }
 
-        rev = c->read;
-        lctx->src_event = *rev;
-        rev->handler = ngx_limit_tcp_event_accept;
-        rev->data = lctx;
+        c->data = lctx;
     }
 
     return NGX_OK;
-}
-
-
-static void
-ngx_limit_tcp_event_accept(ngx_event_t *ev)
-{
-    ngx_limit_tcp_listen_ctx_t  *lctx = ev->data;
-
-    ngx_event_t  *srev;
-
-    ngx_log_debug0(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0, "limit tcp accept");
-
-    srev = &lctx->src_event;
-    *ev = *srev;
-
-    ngx_limit_tcp_event_accept_x(ev, lctx);
-
-    *srev = *ev;
-
-    ev->data = lctx;
-    ev->handler = ngx_limit_tcp_event_accept;
 }
 
 
@@ -876,314 +861,52 @@ ngx_limit_tcp_rbtree_insert_value(ngx_rbtree_node_t *temp,
 }
 
 
-static void
-ngx_limit_tcp_event_accept_x(ngx_event_t *ev, ngx_limit_tcp_listen_ctx_t *lctx)
+static ngx_int_t
+ngx_event_limit_accept_filter(ngx_connection_t *c)
 {
-    socklen_t          socklen;
-    ngx_err_t          err;
-    ngx_log_t         *log;
-    ngx_socket_t       s;
-    ngx_event_t       *rev, *wev;
-    ngx_listening_t   *ls;
-    ngx_connection_t  *c, *lc;
-    ngx_event_conf_t  *ecf;
-    u_char             sa[NGX_SOCKADDRLEN];
-#if (NGX_HAVE_ACCEPT4)
-    static ngx_uint_t  use_accept4 = 1;
-#endif
+    ngx_event_t                 *aev;
+    ngx_listening_t             *ls;
+    ngx_connection_t            *lc;
+    ngx_limit_tcp_listen_ctx_t  *lctx;
+    ngx_limit_tcp_accept_ctx_t  *actx;
 
-    ecf = ngx_event_get_conf(ngx_cycle->conf_ctx, ngx_event_core_module);
+    ngx_log_debug0(NGX_LOG_DEBUG_CORE, c->log, 0, "limit accept filter");
 
-    if (ngx_event_flags & NGX_USE_RTSIG_EVENT) {
-        ev->available = 1;
+    ls = c->listening;
+    lc = ls->connection;
+    lctx = lc->data;
 
-    } else if (!(ngx_event_flags & NGX_USE_KQUEUE_EVENT)) {
-        ev->available = ecf->multi_accept;
+    if (lctx == NULL) {
+        return ngx_event_next_accept_filter(lc);
     }
 
-    lc = ev->data;
-    ls = lc->listening;
-    ev->ready = 0;
+    aev = ngx_pcalloc(c->pool, sizeof(ngx_event_t));
+    if (aev == NULL) {
+        return NGX_ERROR;
+    }
 
-    ngx_log_debug2(NGX_LOG_DEBUG_CORE, ev->log, 0,
-                   "accept on %V, ready: %d", &ls->addr_text, ev->available);
+    actx = ngx_pcalloc(c->pool, sizeof(ngx_limit_tcp_accept_ctx_t));
+    if (actx == NULL) {
+        return NGX_ERROR;
+    }
 
-    do {
-        socklen = NGX_SOCKADDRLEN;
+    ngx_log_error(NGX_LOG_DEBUG, c->log, 0, "limit accept effective %p", c);
 
-#if (NGX_HAVE_ACCEPT4)
-        if (use_accept4) {
-            s = accept4(lc->fd, (struct sockaddr *) sa, &socklen,
-                        SOCK_NONBLOCK);
-        } else {
-            s = accept(lc->fd, (struct sockaddr *) sa, &socklen);
-        }
-#else
-        s = accept(lc->fd, (struct sockaddr *) sa, &socklen);
-#endif
+    actx->connection = c;
+    actx->lctx = lctx;
 
-        if (s == -1) {
-            err = ngx_socket_errno;
+    aev->data = actx;
+    aev->handler = ngx_limit_tcp_accepted;
+    aev->log = c->log;
 
-            if (err == NGX_EAGAIN) {
-                ngx_log_debug0(NGX_LOG_DEBUG_CORE, ev->log, err,
-                               "accept() not ready");
-                return;
-            }
+    if (ngx_use_accept_mutex) {
+        ngx_post_event(aev, &ngx_posted_events);
+        return NGX_DECLINED;
+    }
 
-#if (NGX_HAVE_ACCEPT4)
-            ngx_log_error((ngx_uint_t) ((err == NGX_ECONNABORTED) ?
-                                             NGX_LOG_ERR : NGX_LOG_ALERT),
-                          ev->log, err,
-                          use_accept4 ? "accept4() failed" : "accept() failed");
+    ngx_limit_tcp_accepted(aev);
 
-            if (use_accept4 && err == NGX_ENOSYS) {
-                use_accept4 = 0;
-                ngx_inherited_nonblocking = 0;
-                continue;
-            }
-#else
-            ngx_log_error((ngx_uint_t) ((err == NGX_ECONNABORTED) ?
-                                             NGX_LOG_ERR : NGX_LOG_ALERT),
-                          ev->log, err, "accept() failed");
-#endif
-
-            if (err == NGX_ECONNABORTED) {
-                if (ngx_event_flags & NGX_USE_KQUEUE_EVENT) {
-                    ev->available--;
-                }
-
-                if (ev->available) {
-                    continue;
-                }
-            }
-
-            return;
-        }
-
-#if (NGX_STAT_STUB)
-        (void) ngx_atomic_fetch_add(ngx_stat_accepted, 1);
-#endif
-
-        ngx_accept_disabled = ngx_cycle->connection_n / 8
-                              - ngx_cycle->free_connection_n;
-
-        c = ngx_get_connection(s, ev->log);
-
-        if (c == NULL) {
-            if (ngx_close_socket(s) == -1) {
-                ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno,
-                              ngx_close_socket_n " failed");
-            }
-
-            return;
-        }
-
-#if (NGX_STAT_STUB)
-        (void) ngx_atomic_fetch_add(ngx_stat_active, 1);
-#endif
-
-        c->pool = ngx_create_pool(ls->pool_size, ev->log);
-        if (c->pool == NULL) {
-            ngx_limit_tcp_close_accepted_connection(c);
-            return;
-        }
-
-        c->sockaddr = ngx_palloc(c->pool, socklen);
-        if (c->sockaddr == NULL) {
-            ngx_limit_tcp_close_accepted_connection(c);
-            return;
-        }
-
-        ngx_memcpy(c->sockaddr, sa, socklen);
-
-        log = ngx_palloc(c->pool, sizeof(ngx_log_t));
-        if (log == NULL) {
-            ngx_limit_tcp_close_accepted_connection(c);
-            return;
-        }
-
-        /* set a blocking mode for aio and non-blocking mode for others */
-
-        if (ngx_inherited_nonblocking) {
-            if (ngx_event_flags & NGX_USE_AIO_EVENT) {
-                if (ngx_blocking(s) == -1) {
-                    ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno,
-                                  ngx_blocking_n " failed");
-                    ngx_limit_tcp_close_accepted_connection(c);
-                    return;
-                }
-            }
-
-        } else {
-            if (!(ngx_event_flags & (NGX_USE_AIO_EVENT|NGX_USE_RTSIG_EVENT))) {
-                if (ngx_nonblocking(s) == -1) {
-                    ngx_log_error(NGX_LOG_ALERT, ev->log, ngx_socket_errno,
-                                  ngx_nonblocking_n " failed");
-                    ngx_limit_tcp_close_accepted_connection(c);
-                    return;
-                }
-            }
-        }
-
-        *log = ls->log;
-
-        c->recv = ngx_recv;
-        c->send = ngx_send;
-        c->recv_chain = ngx_recv_chain;
-        c->send_chain = ngx_send_chain;
-
-        c->log = log;
-        c->pool->log = log;
-
-        c->socklen = socklen;
-        c->listening = ls;
-        c->local_sockaddr = ls->sockaddr;
-
-        c->unexpected_eof = 1;
-
-#if (NGX_HAVE_UNIX_DOMAIN)
-        if (c->sockaddr->sa_family == AF_UNIX) {
-            c->tcp_nopush = NGX_TCP_NOPUSH_DISABLED;
-            c->tcp_nodelay = NGX_TCP_NODELAY_DISABLED;
-#if (NGX_SOLARIS)
-            /* Solaris's sendfilev() supports AF_NCA, AF_INET, and AF_INET6 */
-            c->sendfile = 0;
-#endif
-        }
-#endif
-
-        rev = c->read;
-        wev = c->write;
-
-        wev->ready = 1;
-
-        if (ngx_event_flags & (NGX_USE_AIO_EVENT|NGX_USE_RTSIG_EVENT)) {
-            /* rtsig, aio, iocp */
-            rev->ready = 1;
-        }
-
-        if (ev->deferred_accept) {
-            rev->ready = 1;
-#if (NGX_HAVE_KQUEUE)
-            rev->available = 1;
-#endif
-        }
-
-        rev->log = log;
-        wev->log = log;
-
-        /*
-         * TODO: MT: - ngx_atomic_fetch_add()
-         *             or protection by critical section or light mutex
-         *
-         * TODO: MP: - allocated in a shared memory
-         *           - ngx_atomic_fetch_add()
-         *             or protection by critical section or light mutex
-         */
-
-        c->number = ngx_atomic_fetch_add(ngx_connection_counter, 1);
-
-#if (NGX_STAT_STUB)
-        (void) ngx_atomic_fetch_add(ngx_stat_handled, 1);
-#endif
-
-#if (NGX_THREADS)
-        rev->lock = &c->lock;
-        wev->lock = &c->lock;
-        rev->own_lock = &c->lock;
-        wev->own_lock = &c->lock;
-#endif
-
-        if (ls->addr_ntop) {
-            c->addr_text.data = ngx_pnalloc(c->pool, ls->addr_text_max_len);
-            if (c->addr_text.data == NULL) {
-                ngx_limit_tcp_close_accepted_connection(c);
-                return;
-            }
-
-            c->addr_text.len = ngx_sock_ntop(c->sockaddr, c->addr_text.data,
-                                             ls->addr_text_max_len, 0);
-            if (c->addr_text.len == 0) {
-                ngx_limit_tcp_close_accepted_connection(c);
-                return;
-            }
-        }
-
-#if (NGX_DEBUG)
-        {
-
-        in_addr_t            i;
-        ngx_event_debug_t   *dc;
-        struct sockaddr_in  *sin;
-
-        sin = (struct sockaddr_in *) sa;
-        dc = ecf->debug_connection.elts;
-        for (i = 0; i < ecf->debug_connection.nelts; i++) {
-            if ((sin->sin_addr.s_addr & dc[i].mask) == dc[i].addr) {
-                log->log_level = NGX_LOG_DEBUG_CONNECTION|NGX_LOG_DEBUG_ALL;
-                break;
-            }
-        }
-
-        }
-#endif
-
-        ngx_log_debug3(NGX_LOG_DEBUG_CORE, log, 0,
-                       "*%d accept: %V fd:%d", c->number, &c->addr_text, s);
-
-        if (ngx_add_conn && (ngx_event_flags & NGX_USE_EPOLL_EVENT) == 0) {
-            if (ngx_add_conn(c) == NGX_ERROR) {
-                ngx_limit_tcp_close_accepted_connection(c);
-                return;
-            }
-        }
-
-        log->data = NULL;
-        log->handler = NULL;
-
-        /* look up */
-
-        ngx_event_t                 *aev;
-        ngx_limit_tcp_accept_ctx_t  *actx;
-
-        aev = ngx_pcalloc(c->pool, sizeof(ngx_event_t));
-        if (aev == NULL) {
-            ngx_limit_tcp_close_accepted_connection(c);
-            return;
-        }
-
-        actx = ngx_pcalloc(c->pool, sizeof(ngx_limit_tcp_accept_ctx_t));
-        if (actx == NULL) {
-            ngx_limit_tcp_close_accepted_connection(c);
-            return;
-        }
-
-        actx->connection = c;
-        actx->lctx = lctx;
-
-        aev->data = actx;
-        aev->handler = ngx_limit_tcp_accepted;
-        aev->log = ev->log;
-
-        if (ngx_use_accept_mutex) {
-
-            ngx_post_event(aev, &ngx_posted_events);
-
-            if (ngx_event_flags & NGX_USE_KQUEUE_EVENT) {
-                ev->available--;
-            }
-
-            continue;
-        }
-
-        ngx_limit_tcp_accepted(aev);
-
-        if (ngx_event_flags & NGX_USE_KQUEUE_EVENT) {
-            ev->available--;
-        }
-
-    } while (ev->available);
+    return NGX_DECLINED;
 }
 
 
@@ -1208,8 +931,10 @@ ngx_limit_tcp_accepted(ngx_event_t *ev)
     ls = c->listening;
     lctx = actx->lctx;
 
+    ngx_log_debug0(NGX_LOG_DEBUG_CORE, ev->log, 0, "limit tcp accepted");
+
     if (ngx_connection_local_sockaddr(c, NULL, 0) != NGX_OK) {
-        ngx_limit_tcp_close_accepted_connection(c);
+        ngx_close_accepted_connection(c);
         return;
     }
 
@@ -1227,7 +952,7 @@ ngx_limit_tcp_accepted(ngx_event_t *ev)
     rc = ngx_limit_tcp_find(c);
     if (rc == NGX_BUSY) {
 
-        ngx_limit_tcp_close_accepted_connection(c);
+        ngx_close_accepted_connection(c);
         return;
 
     } else if (rc == NGX_DECLINED) {
@@ -1246,13 +971,13 @@ ngx_limit_tcp_accepted(ngx_event_t *ev)
     ngx_shmtx_unlock(&ctx->shpool->mutex);
 
     if (rc == NGX_BUSY) {
-        ngx_limit_tcp_close_accepted_connection(c);
+        ngx_close_accepted_connection(c);
         return;
     }
 
     cctx = ngx_pcalloc(c->pool, sizeof(ngx_limit_tcp_clean_ctx_t));
     if (cctx == NULL) {
-        ngx_limit_tcp_close_accepted_connection(c);
+        ngx_close_accepted_connection(c);
         return;
     }
 
@@ -1261,7 +986,7 @@ ngx_limit_tcp_accepted(ngx_event_t *ev)
 
     cln = ngx_pool_cleanup_add(c->pool, 0);
     if (cln == NULL) {
-        ngx_limit_tcp_close_accepted_connection(c);
+        ngx_close_accepted_connection(c);
         return;
     }
 
@@ -1282,14 +1007,14 @@ ngx_limit_tcp_accepted(ngx_event_t *ev)
         delay_time = (ngx_msec_t) delay_excess * 1000 / ctx->rate;
 
         if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-            ngx_limit_tcp_close_accepted_connection(c);
+            ngx_close_accepted_connection(c);
             return;
         }
 
         dctx = ngx_pcalloc(c->pool, sizeof(ngx_limit_tcp_delay_ctx_t));
 
         if (dctx == NULL) {
-            ngx_limit_tcp_close_accepted_connection(c);
+            ngx_close_accepted_connection(c);
             return;
         }
 
@@ -1310,41 +1035,12 @@ ngx_limit_tcp_accepted(ngx_event_t *ev)
 
         ngx_add_timer(c->write, delay_time);
 
-        if (ngx_event_flags & NGX_USE_KQUEUE_EVENT) {
-            ev->available--;
-        }
-
         return;
     }
 
 accept_continue:
 
     ls->handler(c);
-}
-
-
-static void
-ngx_limit_tcp_close_accepted_connection(ngx_connection_t *c)
-{
-    ngx_socket_t  fd;
-
-    ngx_free_connection(c);
-
-    fd = c->fd;
-    c->fd = (ngx_socket_t) -1;
-
-    if (ngx_close_socket(fd) == -1) {
-        ngx_log_error(NGX_LOG_ALERT, c->log, ngx_socket_errno,
-                      ngx_close_socket_n " failed");
-    }
-
-    if (c->pool) {
-        ngx_destroy_pool(c->pool);
-    }
-
-#if (NGX_STAT_STUB)
-    (void) ngx_atomic_fetch_add(ngx_stat_active, -1);
-#endif
 }
 
 
@@ -1393,10 +1089,10 @@ ngx_limit_tcp_lookup(ngx_connection_t *c, ngx_limit_tcp_ctx_t *ctx,
             ngx_queue_insert_head(&ctx->sh->queue, &lr->queue);
 
             ngx_log_debug3(NGX_LOG_DEBUG_CORE, c->log, 0,
-                           "limit tcp count %ui %ui %ui",
+                           "limit tcp count %ui %ui %p",
                            lr->count, addr.len, addr.data);
 
-            if (ctx->concurrent && lr->count > ctx->concurrent) {
+            if (ctx->concurrent && lr->count + 1 > ctx->concurrent) {
                 return NGX_BUSY;
             }
 
@@ -1597,7 +1293,7 @@ ngx_limit_tcp_test_reading(ngx_event_t *ev)
     if ((ngx_event_flags & NGX_USE_LEVEL_EVENT) && rev->active) {
 
         if (ngx_del_event(rev, NGX_READ_EVENT, 0) != NGX_OK) {
-            ngx_limit_tcp_close_accepted_connection(c);
+            ngx_close_accepted_connection(c);
         }
     }
 
@@ -1612,7 +1308,7 @@ closed:
     ngx_log_error(NGX_LOG_INFO, c->log, err,
                   "client closed prematurely connection");
 
-    ngx_limit_tcp_close_accepted_connection(c);
+    ngx_close_accepted_connection(c);
 }
 
 
@@ -1635,7 +1331,7 @@ ngx_limit_tcp_delay(ngx_event_t *ev)
     if (!c->write->timedout) {
 
         if (ngx_handle_write_event(c->write, 0) != NGX_OK) {
-            ngx_limit_tcp_close_accepted_connection(c);
+            ngx_close_accepted_connection(c);
         }
 
         return;
@@ -1644,7 +1340,7 @@ ngx_limit_tcp_delay(ngx_event_t *ev)
     c->write->timedout = 0;
 
     if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
-        ngx_limit_tcp_close_accepted_connection(c);
+        ngx_close_accepted_connection(c);
         return;
     }
 

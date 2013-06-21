@@ -14,7 +14,7 @@ use Test::Nginx;
 
 my $NGINX = defined $ENV{TEST_NGINX_BINARY} ? $ENV{TEST_NGINX_BINARY}
         : '../nginx/objs/nginx';
-my $t = Test::Nginx->new()->plan(22);
+my $t = Test::Nginx->new()->plan(28);
 
 sub mhttp_get($;$;$;%) {
     my ($url, $port, %extra) = @_;
@@ -57,8 +57,7 @@ sub mrun($;$) {
 
 ###############################################################################
 
-select STDERR; $| = 1;
-select STDOUT; $| = 1;
+select STDERR;
 
 warn "your test dir is ".$t->testdir();
 
@@ -223,6 +222,78 @@ unlike(mhttp_get('/', 8089), qr/8089/m, '2013-04-16 00:28:44');
 unlike(mhttp_get('/', 8089), qr/8089/m, '2013-04-16 00:27:46');
 
 $t->stop();
+
+##############################################################################
+
+$t->write_file_expand('nginx.conf', <<'EOF');
+
+%%TEST_GLOBALS%%
+
+daemon off;
+
+worker_processes auto;
+
+events {
+    accept_mutex off;
+}
+
+
+limit_tcp 8088 concurrent=1;
+limit_tcp 8089 concurrent=2 name=test:2m;
+
+http {
+    server {
+        listen 8088;
+        location / {
+            echo 8088;
+        }
+    }
+
+    server {
+        listen 8089;
+        location / {
+            echo 8089;
+        }
+    }
+}
+EOF
+
+mrun($t);
+
+##############################################################################
+
+my $s = IO::Socket::INET->new(
+    Proto => 'tcp',
+    PeerAddr => '127.0.0.1:8088'
+    );
+
+print "\n";
+print $s,"\n";
+
+unlike(mhttp_get('/', 8088), qr/8088/m, '2013-04-16 00:27:55');
+close($s);
+
+like(mhttp_get('/', 8088), qr/8088/m, '2013-04-16 00:27:56');
+like(mhttp_get('/', 8088), qr/8088/m, '2013-04-16 00:27:57');
+
+my $s1 = IO::Socket::INET->new(
+    Proto => 'tcp',
+    PeerAddr => '127.0.0.1:8089'
+    );
+
+like(mhttp_get('/', 8089), qr/8089/m, '2013-04-16 00:28:06');
+
+my $s2 = IO::Socket::INET->new(
+    Proto => 'tcp',
+    PeerAddr => '127.0.0.1:8089'
+    );
+
+unlike(mhttp_get('/', 8089), qr/8089/m, '2013-04-16 00:28:07');
+close($s1);
+close($s2);
+
+like(mhttp_get('/', 8089), qr/8089/m, '2013-04-16 00:28:06');
+
 
 ##############################################################################
 
