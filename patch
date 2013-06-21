@@ -1,0 +1,120 @@
+commit 64cf997d52b6508abad7c2f26d71aab4a63fe2ec
+Author: yzprofile <yzprofiles@gmail.com>
+Date:   Mon May 13 10:51:03 2013 +0800
+
+    Added accept filter
+
+diff --git a/src/event/ngx_event.c b/src/event/ngx_event.c
+index 3d2a833..0c50f3d 100644
+--- a/src/event/ngx_event.c
++++ b/src/event/ngx_event.c
+@@ -34,6 +34,9 @@ static char *ngx_event_debug_connection(ngx_conf_t *cf, ngx_command_t *cmd,
+ 
+ static void *ngx_event_core_create_conf(ngx_cycle_t *cycle);
+ static char *ngx_event_core_init_conf(ngx_cycle_t *cycle, void *conf);
++static ngx_int_t ngx_event_dummy_accept_filter(ngx_connection_t *c);
++
++ngx_int_t  (*ngx_event_top_accept_filter) (ngx_connection_t *c);
+ 
+ 
+ static ngx_uint_t     ngx_timer_resolution;
+@@ -938,6 +941,8 @@ ngx_events_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+         }
+     }
+ 
++    ngx_event_top_accept_filter = ngx_event_dummy_accept_filter;
++
+     pcf = *cf;
+     cf->ctx = ctx;
+     cf->module_type = NGX_EVENT_MODULE;
+@@ -1327,3 +1332,12 @@ ngx_event_core_init_conf(ngx_cycle_t *cycle, void *conf)
+ 
+ #endif
+ }
++
++
++static ngx_int_t
++ngx_event_dummy_accept_filter(ngx_connection_t *c)
++{
++    ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0, "event dummy accept filter");
++
++    return NGX_OK;
++}
+diff --git a/src/event/ngx_event.h b/src/event/ngx_event.h
+index 9bd87a5..2b1c65e 100644
+--- a/src/event/ngx_event.h
++++ b/src/event/ngx_event.h
+@@ -240,8 +240,11 @@ typedef struct {
+ } ngx_event_actions_t;
+ 
+ 
+-extern ngx_event_actions_t   ngx_event_actions;
++typedef ngx_int_t (*ngx_event_accept_filter_pt) (ngx_connection_t *c);
++
+ 
++extern ngx_event_actions_t   ngx_event_actions;
++extern ngx_event_accept_filter_pt ngx_event_top_accept_filter;
+ 
+ /*
+  * The event filter requires to read/write the whole data:
+@@ -552,6 +555,9 @@ u_char *ngx_acceptex_log_error(ngx_log_t *log, u_char *buf, size_t len);
+ ngx_int_t ngx_send_lowat(ngx_connection_t *c, size_t lowat);
+ 
+ 
++void ngx_close_accepted_connection(ngx_connection_t *c);
++
++
+ /* used in ngx_log_debugX() */
+ #define ngx_event_ident(p)  ((ngx_connection_t *) (p))->fd
+ 
+diff --git a/src/event/ngx_event_accept.c b/src/event/ngx_event_accept.c
+index 6087d60..b6315ff 100644
+--- a/src/event/ngx_event_accept.c
++++ b/src/event/ngx_event_accept.c
+@@ -12,12 +12,12 @@
+ 
+ static ngx_int_t ngx_enable_accept_events(ngx_cycle_t *cycle);
+ static ngx_int_t ngx_disable_accept_events(ngx_cycle_t *cycle);
+-static void ngx_close_accepted_connection(ngx_connection_t *c);
+ 
+ 
+ void
+ ngx_event_accept(ngx_event_t *ev)
+ {
++    ngx_int_t          rc;
+     socklen_t          socklen;
+     ngx_err_t          err;
+     ngx_log_t         *log;
+@@ -354,6 +354,23 @@ ngx_event_accept(ngx_event_t *ev)
+         log->data = NULL;
+         log->handler = NULL;
+ 
++        /* accept filter */
++
++        rc = ngx_event_top_accept_filter(c);
++
++        if (rc == NGX_ERROR) {
++            ngx_close_accepted_connection(c);
++            return;
++        }
++
++        if (rc == NGX_DECLINED) {
++            if (ngx_event_flags & NGX_USE_KQUEUE_EVENT) {
++                ev->available--;
++            }
++
++            continue;
++        }
++
+         ls->handler(c);
+ 
+         if (ngx_event_flags & NGX_USE_KQUEUE_EVENT) {
+@@ -472,7 +489,7 @@ ngx_disable_accept_events(ngx_cycle_t *cycle)
+ }
+ 
+ 
+-static void
++void
+ ngx_close_accepted_connection(ngx_connection_t *c)
+ {
+     ngx_socket_t  fd;

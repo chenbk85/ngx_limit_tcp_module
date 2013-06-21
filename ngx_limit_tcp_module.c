@@ -132,8 +132,10 @@ static void ngx_limit_tcp_cleanup(void *data);
 static ngx_int_t ngx_limit_tcp_find(ngx_connection_t *c);
 static ngx_int_t ngx_limit_tcp_inet(ngx_connection_t *c,
     ngx_limit_tcp_conf_t *ltcf, in_addr_t addr);
+#if (NGX_HAVE_INET6)
 static ngx_int_t ngx_limit_tcp_inet6(ngx_connection_t *c,
     ngx_limit_tcp_conf_t *ltcf, u_char *p);
+#endif
 static ngx_int_t ngx_limit_tcp_get_addr_index(ngx_listening_t *ls,
     struct sockaddr *addr, ngx_flag_t type);
 #if (NGX_LIMIT_TCP_WITH_MAIL)
@@ -1419,13 +1421,14 @@ ngx_limit_tcp_find(ngx_connection_t *c)
 }
 
 
+#if (NGX_HAVE_INET6)
 static ngx_int_t
 ngx_limit_tcp_inet6(ngx_connection_t *c, ngx_limit_tcp_conf_t *ltcf,
     u_char *p)
 {
     ngx_uint_t                n;
     ngx_uint_t                i;
-    ngx_limit_tcp_rule6_t  *rule6;
+    ngx_limit_tcp_rule6_t    *rule6;
 
     rule6 = ltcf->rules6->elts;
     for (i = 0; i < ltcf->rules6->nelts; i++) {
@@ -1460,6 +1463,7 @@ ngx_limit_tcp_inet6(ngx_connection_t *c, ngx_limit_tcp_conf_t *ltcf,
 
     return NGX_OK;
 }
+#endif
 
 
 static ngx_int_t
