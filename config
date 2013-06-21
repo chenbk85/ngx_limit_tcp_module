@@ -1,0 +1,8 @@
+ngx_addon_name=ngx_limit_tcp_module
+EVENT_MODULES="$EVENT_MODULES ngx_limit_tcp_module"
+NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_limit_tcp_module.c"
+
+
+if [ $MAIL = YES ]; then
+    have=NGX_LIMIT_TCP_WITH_MAIL . auto/have
+fi
