@@ -1,7 +1,7 @@
-## 介绍
-这个模块可以用来限制来自每一个IP的TCP连接频率和并发数。
+## Description
+This module can be used for limiting accept events and concurrent.
 
-### 配置样例
+### Config Sample
 
     daemon off;
     error_log logs/error.log debug;
@@ -41,7 +41,8 @@
         }
     }
 
-## 指令
+
+## Directives
 
 Syntax: **limit_tcp name:size addr:port [rate= burst= nodelay] [concurrent=]**
 
@@ -49,7 +50,11 @@ Default: `none`
 
 Context: `main`
 
-设置监听端口针对访问IP的频率和并发数限制。
+Sets a shared memory zone and the maximum burst size of requests. If the rate of requests exceeds the rate configured for a zone, their processing is delayed such that requests are processed at a defined rate. Excessive requests are delayed until their number exceeds the maximum burst size or out of maximum concurrent in which case the request is closed after accepted.
+
+For example, the directives
+
+    limit_tcp 8080 8081 rate=1r/m burst=100 name=share_mem:10M concurrent=10;
 
 
 Syntax: **limit_tcp_allow address | CIDR | all**
@@ -58,7 +63,7 @@ Default: `none`
 
 Context: `main`
 
-允许指定的网络地址访问。
+Allows access for the specified network or address.
 
 
 Syntax: **limit_tcp_deny address | CIDR | all**
@@ -67,7 +72,7 @@ Default: `none`
 
 Context: `main`
 
-拒绝指定的网络地址访问。
+Denies access for the specified network or address.
 
 
 ## Copyright & License
