@@ -262,7 +262,7 @@ ngx_limit_tcp_init_zone(ngx_shm_zone_t *shm_zone, void *data)
         return NGX_ERROR;
     }
 
-    ngx_sprintf(ctx->shpool->log_ctx, " in limit_req zone \"%V\"%Z",
+    ngx_sprintf(ctx->shpool->log_ctx, " in limit_tcp zone \"%V\"%Z",
                 &shm_zone->shm.name);
 
     return NGX_OK;
@@ -954,7 +954,10 @@ ngx_limit_tcp_accepted(ngx_event_t *ev)
     rc = ngx_limit_tcp_find(c);
     if (rc == NGX_BUSY) {
 
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, ev->log, 0,
+                       "limit %V find in black list", &c->addr_text);
         ngx_close_accepted_connection(c);
+
         return;
 
     } else if (rc == NGX_DECLINED) {
@@ -968,9 +971,15 @@ ngx_limit_tcp_accepted(ngx_event_t *ev)
     ngx_shmtx_lock(&ctx->shpool->mutex);
     ngx_limit_tcp_expire(c, ctx, 1);
 
+    excess = 0;
+    node = 0;
     rc = ngx_limit_tcp_lookup(c, ctx, &excess, &node);
 
     ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+    if (rc == NGX_ERROR || node == 0) {
+        goto accept_continue;
+    }
 
     if (rc == NGX_BUSY) {
         ngx_close_accepted_connection(c);
@@ -1095,6 +1104,9 @@ ngx_limit_tcp_lookup(ngx_connection_t *c, ngx_limit_tcp_ctx_t *ctx,
                            lr->count, addr.len, addr.data);
 
             if (ctx->concurrent && lr->count + 1 > ctx->concurrent) {
+                ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                              "limit tcp %V over concurrent: %ui",
+                              &c->addr_text, lr->count);
                 return NGX_BUSY;
             }
 
@@ -1118,6 +1130,8 @@ ngx_limit_tcp_lookup(ngx_connection_t *c, ngx_limit_tcp_ctx_t *ctx,
             *ep = excess;
 
             if ((ngx_uint_t) excess > ctx->burst) {
+                ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                              "limit %V over rate: %i", &c->addr_text, excess);
                 return NGX_BUSY;
             }
 
