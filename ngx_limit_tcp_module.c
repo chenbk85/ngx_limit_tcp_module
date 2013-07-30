@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2010-2013 Alibaba Group Holding Limited
+ */
+
+
 #include <ngx_core.h>
 #include <ngx_event.h>
 #include <ngx_config.h>
@@ -345,7 +350,7 @@ ngx_conf_limit_tcp(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
 
             rate = ngx_atoi(value[i].data + 5, len - 5);
-            if (rate <= NGX_ERROR) {
+            if (rate <= 0) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                    "invalid rate \"%V\"", &value[i]);
                 return NGX_CONF_ERROR;
@@ -1103,14 +1108,17 @@ ngx_limit_tcp_lookup(ngx_connection_t *c, ngx_limit_tcp_ctx_t *ctx,
                            "limit tcp count %ui %ui %p",
                            lr->count, addr.len, addr.data);
 
-            if (ctx->concurrent && lr->count + 1 > ctx->concurrent) {
+            (void) ngx_atomic_fetch_add(&lr->count, 1);
+
+            if (ctx->concurrent && lr->count > ctx->concurrent) {
                 ngx_log_error(NGX_LOG_INFO, c->log, 0,
                               "limit tcp %V over concurrent: %ui",
                               &c->addr_text, lr->count);
+
+                (void) ngx_atomic_fetch_add(&lr->count, -1);
+
                 return NGX_BUSY;
             }
-
-            (void) ngx_atomic_fetch_add(&lr->count, 1);
 
             if (!ctx->rate) {
                 return NGX_OK;
@@ -1132,6 +1140,7 @@ ngx_limit_tcp_lookup(ngx_connection_t *c, ngx_limit_tcp_ctx_t *ctx,
             if ((ngx_uint_t) excess > ctx->burst) {
                 ngx_log_error(NGX_LOG_INFO, c->log, 0,
                               "limit %V over rate: %i", &c->addr_text, excess);
+                (void) ngx_atomic_fetch_add(&lr->count, -1);
                 return NGX_BUSY;
             }
 
@@ -1383,6 +1392,9 @@ ngx_limit_tcp_cleanup(void *data)
                        "delete connection timer");
         ngx_del_timer(c->write);
     }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, c->log, 0,
+                   "limit tcp cleanup connection count: [%ui]", node->count);
 
     (void) ngx_atomic_fetch_add(&node->count, -1);
 }
