@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2010-2013 Alibaba Group Holding Limited
+ */
+
+
 #include <ngx_core.h>
 #include <ngx_event.h>
 #include <ngx_config.h>
@@ -262,7 +267,7 @@ ngx_limit_tcp_init_zone(ngx_shm_zone_t *shm_zone, void *data)
         return NGX_ERROR;
     }
 
-    ngx_sprintf(ctx->shpool->log_ctx, " in limit_req zone \"%V\"%Z",
+    ngx_sprintf(ctx->shpool->log_ctx, " in limit_tcp zone \"%V\"%Z",
                 &shm_zone->shm.name);
 
     return NGX_OK;
@@ -345,7 +350,7 @@ ngx_conf_limit_tcp(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
 
             rate = ngx_atoi(value[i].data + 5, len - 5);
-            if (rate <= NGX_ERROR) {
+            if (rate <= 0) {
                 ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                                    "invalid rate \"%V\"", &value[i]);
                 return NGX_CONF_ERROR;
@@ -406,6 +411,12 @@ ngx_conf_limit_tcp(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             addr->socklen = u.socklen;
             addr->addr_text = u.url;
         }
+    }
+
+    if (concurrent == 0 && rate == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "you need to set concurrent or rate");
+        return NGX_CONF_ERROR;
     }
 
     shm_zone = ngx_shared_memory_add(cf, &name, size, &ngx_limit_tcp_module);
@@ -592,6 +603,8 @@ ngx_limit_tcp_mail_get_addr_index(ngx_listening_t *ls, struct sockaddr *addr,
     ngx_mail_in6_addr_t  *maddr6;
 #endif
 
+    port = ls->servers;
+
     switch (ls->sockaddr->sa_family) {
 
 #if (NGX_HAVE_INET6)
@@ -610,17 +623,18 @@ ngx_limit_tcp_mail_get_addr_index(ngx_listening_t *ls, struct sockaddr *addr,
             }
         }
 
-        if (port->naddrs > 1) {
-            for (i = 0; i < port->naddrs; i++) {
-                if (ngx_memcmp(&maddr6[i].addr6, &sin6->sin6_addr, 16) == 0) {
-                    return i;
-                }
+        for (i = 0; i < port->naddrs; i++) {
+            if (ngx_memcmp(&maddr6[i].addr6, &sin6->sin6_addr, 16) == 0) {
+                return i;
             }
-        } else {
-            return 0;
         }
 
-        break;
+        if (type) {
+            break;
+        } else {
+            return i - 1;
+        }
+
 #endif
 
     default:
@@ -634,19 +648,17 @@ ngx_limit_tcp_mail_get_addr_index(ngx_listening_t *ls, struct sockaddr *addr,
             }
         }
 
-        if (port->naddrs > 1) {
-
-            for (i = 0; i < port->naddrs; i++) {
-                if (maddr[i].addr == sin->sin_addr.s_addr) {
-                    return i;
-                }
+        for (i = 0; i < port->naddrs; i++) {
+            if (maddr[i].addr == sin->sin_addr.s_addr) {
+                return i;
             }
-        } else {
-            return 0;
         }
 
-        break;
-
+        if (type) {
+            break;
+        } else {
+            return i - 1;
+        }
     }
 
     return NGX_ERROR;
@@ -689,19 +701,18 @@ ngx_limit_tcp_http_get_addr_index(ngx_listening_t *ls, struct sockaddr *addr,
             }
         }
 
-        if (port->naddrs > 1) {
-
-            for (i = 0; i < port->naddrs; i++) {
-                if (ngx_memcmp(&haddr6[i].addr6, &sin6->sin6_addr, 16) == 0) {
-                    return i;
-                }
+        for (i = 0; i < port->naddrs; i++) {
+            if (ngx_memcmp(&haddr6[i].addr6, &sin6->sin6_addr, 16) == 0) {
+                return i;
             }
-
-        } else {
-            return 0;
         }
 
-        break;
+        if (type) {
+            break;
+        } else {
+            return i - 1;
+        }
+
 #endif
 
     default:
@@ -715,32 +726,36 @@ ngx_limit_tcp_http_get_addr_index(ngx_listening_t *ls, struct sockaddr *addr,
             }
         }
 
-        if (port->naddrs > 1) {
 
-            for (i = 0; i < port->naddrs; i++) {
+        for (i = 0; i < port->naddrs; i++) {
 
 #if NGX_DEBUG
-                u_char                     ip_str[80];
+            u_char  ip1[NGX_INET6_ADDRSTRLEN], ip2[NGX_INET6_ADDRSTRLEN];
 
-                ngx_memzero(ip_str, 80);
+            ngx_memzero(ip1, NGX_INET6_ADDRSTRLEN);
+            ngx_memzero(ip2, NGX_INET6_ADDRSTRLEN);
 
-                (void) ngx_inet_ntop(AF_INET, &sin->sin_addr, ip_str, 80);
+            (void) ngx_inet_ntop(AF_INET, &sin->sin_addr, ip1,
+                                 NGX_INET6_ADDRSTRLEN);
 
-                ngx_log_debug1(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
-                               "%s", ip_str);
+            (void) ngx_inet_ntop(AF_INET, &haddr[i].addr, ip2,
+                                 NGX_INET6_ADDRSTRLEN);
+
+            ngx_log_debug2(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
+                           "limit %s to %s", ip1, ip2);
 #endif
 
-                if (haddr[i].addr == sin->sin_addr.s_addr) {
-                    return i;
-                }
+            if (haddr[i].addr == sin->sin_addr.s_addr) {
+                return i;
             }
 
-        } else {
-            return 0;
         }
 
-        break;
-
+        if (type) {
+            break;
+        } else {
+            return i - 1;
+        }
     }
 
     return NGX_ERROR;
@@ -785,7 +800,8 @@ ngx_limit_tcp_init_process(ngx_cycle_t *cycle)
 
         if (!c) {
             ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
-                           "listen %V has no connection", &ls[i].addr_text);
+                           "limit listen %V has no connection",
+                           &ls[i].addr_text);
             continue;
         }
 
@@ -805,7 +821,7 @@ ngx_limit_tcp_init_process(ngx_cycle_t *cycle)
             idx = ngx_limit_tcp_get_addr_index(&ls[i], &paddr[j]->sockaddr, 1);
 
             ngx_log_debug3(NGX_LOG_DEBUG_CORE, cycle->log, 0,
-                           "listen %V %V matched idx: %i",
+                           "limit listen %V %V matched idx: %i",
                            &ls[i].addr_text, &paddr[j]->addr_text, idx);
 
             if (idx == NGX_ERROR) {
@@ -954,7 +970,10 @@ ngx_limit_tcp_accepted(ngx_event_t *ev)
     rc = ngx_limit_tcp_find(c);
     if (rc == NGX_BUSY) {
 
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, ev->log, 0,
+                       "limit %V find in black list", &c->addr_text);
         ngx_close_accepted_connection(c);
+
         return;
 
     } else if (rc == NGX_DECLINED) {
@@ -968,9 +987,15 @@ ngx_limit_tcp_accepted(ngx_event_t *ev)
     ngx_shmtx_lock(&ctx->shpool->mutex);
     ngx_limit_tcp_expire(c, ctx, 1);
 
+    excess = 0;
+    node = 0;
     rc = ngx_limit_tcp_lookup(c, ctx, &excess, &node);
 
     ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+    if (rc == NGX_ERROR || node == 0) {
+        goto accept_continue;
+    }
 
     if (rc == NGX_BUSY) {
         ngx_close_accepted_connection(c);
@@ -1090,11 +1115,14 @@ ngx_limit_tcp_lookup(ngx_connection_t *c, ngx_limit_tcp_ctx_t *ctx,
             ngx_queue_remove(&lr->queue);
             ngx_queue_insert_head(&ctx->sh->queue, &lr->queue);
 
-            ngx_log_debug3(NGX_LOG_DEBUG_CORE, c->log, 0,
-                           "limit tcp count %ui %ui %p",
-                           lr->count, addr.len, addr.data);
+            ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                           "limit tcp count %ui %p", lr->count, c);
 
-            if (ctx->concurrent && lr->count + 1 > ctx->concurrent) {
+            if (ctx->concurrent && lr->count >= ctx->concurrent) {
+                ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                              "limit tcp %V over concurrent: %ui",
+                              &c->addr_text, lr->count);
+
                 return NGX_BUSY;
             }
 
@@ -1118,6 +1146,9 @@ ngx_limit_tcp_lookup(ngx_connection_t *c, ngx_limit_tcp_ctx_t *ctx,
             *ep = excess;
 
             if ((ngx_uint_t) excess > ctx->burst) {
+                ngx_log_error(NGX_LOG_WARN, c->log, 0,
+                              "limit %V over rate: %i", &c->addr_text, excess);
+                (void) ngx_atomic_fetch_add(&lr->count, -1);
                 return NGX_BUSY;
             }
 
@@ -1369,6 +1400,10 @@ ngx_limit_tcp_cleanup(void *data)
                        "delete connection timer");
         ngx_del_timer(c->write);
     }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, c->log, 0,
+                   "limit tcp cleanup connection count: [%ui] %p",
+                   node->count, c);
 
     (void) ngx_atomic_fetch_add(&node->count, -1);
 }
